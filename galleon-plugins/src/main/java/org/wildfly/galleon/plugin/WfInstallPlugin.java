@@ -44,12 +44,15 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -115,7 +118,7 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
 
     private ProvisioningRuntime runtime;
     private MessageWriter log;
-    private PropertyResolver versionResolver;
+    private VersionResolver versionResolver;
 
     private Map<FPID, Properties> fpTasksProps = Collections.emptyMap();
     private Properties mergedTaskProps = new Properties();
@@ -156,8 +159,11 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
 
         thinServer = runtime.isOptionSet(OPTION_MVN_DIST);
 
-        final Map<String, String> artifactVersions = new HashMap<>();
+        final VersionResolver.Builder vrBuilder = new VersionResolver.Builder();
         for(FeaturePackRuntime fp : runtime.getFeaturePacks()) {
+            List<FPID> deps = fp.getSpec().getFeaturePackDeps().stream().map(dep -> dep.getLocation().getFPID()).collect(Collectors.toList());
+            vrBuilder.dependency(fp.getFPID(), deps);
+
             final Path wfRes = fp.getResource(WfConstants.WILDFLY);
             if(!Files.exists(wfRes)) {
                 continue;
@@ -165,15 +171,15 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
 
             final Path artifactProps = wfRes.resolve(WfConstants.ARTIFACT_VERSIONS_PROPS);
             if(Files.exists(artifactProps)) {
-                try (Stream<String> lines = Files.lines(artifactProps)) {
+                try(Stream<String> lines = Files.lines(artifactProps)) {
                     final Iterator<String> iterator = lines.iterator();
-                    while (iterator.hasNext()) {
+                    while(iterator.hasNext()) {
                         final String line = iterator.next();
                         final int i = line.indexOf('=');
-                        if (i < 0) {
+                        if(i < 0) {
                             throw new ProvisioningException("Failed to locate '=' character in " + line);
                         }
-                        artifactVersions.put(line.substring(0, i), line.substring(i + 1));
+                        vrBuilder.artifactVersion(fp.getFPID(), line.substring(0, i), line.substring(i + 1));
                     }
                 } catch (IOException e) {
                     throw new ProvisioningException(Errors.readFile(artifactProps), e);
@@ -207,7 +213,7 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
             }
         }
         mergedTaskPropsResolver = new MapPropertyResolver(mergedTaskProps);
-        versionResolver = new MapPropertyResolver(artifactVersions);
+        versionResolver = vrBuilder.build();
 
         pkgProgressTracker = runtime.getLayoutFactory().getProgressTracker(ProvisioningLayoutFactory.TRACK_PACKAGES);
         long pkgsTotal = 0;
@@ -427,7 +433,7 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
     }
 
     private String resolveRequiredGav(String artifactGa) throws ProvisioningException {
-        String gavStr = versionResolver.resolveProperty(artifactGa);
+        String gavStr = versionResolver.resolveVersion(artifactGa);
         if(gavStr == null) {
             throw new ProvisioningException("Failed to resolve version of " + artifactGa);
         }
@@ -539,13 +545,12 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
         }
     }
 
-    private void processModules(FPID fp, String pkgName, Path fpModuleDir) throws ProvisioningException {
+    private void processModules(FPID fp, final String fpId, Path fpModuleDir) throws ProvisioningException {
         try {
             final Path installDir = runtime.getStagedDir();
             Files.walkFileTree(fpModuleDir, new SimpleFileVisitor<Path>() {
                 @Override
-                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs)
-                    throws IOException {
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
                     final Path targetDir = installDir.resolve(fpModuleDir.relativize(dir));
                     try {
                         Files.copy(dir, targetDir);
@@ -557,10 +562,9 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
                     return FileVisitResult.CONTINUE;
                 }
                 @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
-                    throws IOException {
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                     if(file.getFileName().toString().equals(WfConstants.MODULE_XML)) {
-                        processModuleTemplate(fpModuleDir, installDir, file);
+                        processModuleTemplate(fp, fpModuleDir, installDir, file);
                     } else {
                         Files.copy(file, installDir.resolve(fpModuleDir.relativize(file)), StandardCopyOption.REPLACE_EXISTING);
                     }
@@ -568,11 +572,12 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
                 }
             });
         } catch (IOException e) {
-            throw new ProvisioningException("Failed to process modules from package " + pkgName + " from feature-pack " + fp, e);
+            throw new ProvisioningException("Failed to process modules from package " + fpId + " from feature-pack " + fp, e);
         }
     }
 
-    private void processModuleTemplate(Path fpModuleDir, final Path installDir, Path moduleTemplate) throws IOException {
+    private void processModuleTemplate(FPID fpId, Path fpModuleDir, final Path installDir, Path moduleTemplate)
+            throws IOException {
         final Builder builder = new Builder(false);
         final Document document;
         try (BufferedReader reader = Files.newBufferedReader(moduleTemplate, StandardCharsets.UTF_8)) {
@@ -604,10 +609,10 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
                 } else {
                     artifactName = exprBody;
                 }
-                final String resolved = versionResolver.resolveProperty(artifactName);
+                final String resolved = versionResolver.resolveVersion(fpId, artifactName);
                 if (resolved != null) {
                     try {
-                        versionAttribute.setValue(toArtifactCoords(resolved, false).getVersion());
+                        versionAttribute.setValue(toArtifactCoords(fpId, resolved, false).getVersion());
                     } catch (ProvisioningException e) {
                         throw new IOException("Failed to resolve artifact coordinates for " + resolved, e);
                     }
@@ -632,7 +637,7 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
                         jandex = coordsStr.indexOf("jandex", optionsIndex) >= 0;
                         coordsStr = coordsStr.substring(0, optionsIndex);
                     }
-                    coordsStr = versionResolver.resolveProperty(coordsStr);
+                    coordsStr = versionResolver.resolveVersion(fpId, coordsStr);
                 }
 
                 if(coordsStr == null) {
@@ -641,7 +646,7 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
 
                 ArtifactCoords coords;
                 try {
-                    coords = toArtifactCoords(coordsStr, false);
+                    coords = toArtifactCoords(fpId, coordsStr, false);
                 } catch (ProvisioningException e) {
                     throw new IOException("Failed to resolve full coordinates for " + coordsStr, e);
                 }
@@ -723,8 +728,8 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
         }
     }
 
-    public void copyArtifact(CopyArtifact copyArtifact) throws ProvisioningException, ArtifactException {
-        final ArtifactCoords coords = toArtifactCoords(copyArtifact.getArtifact(), copyArtifact.isOptional());
+    public void copyArtifact(FPID fpId, CopyArtifact copyArtifact) throws ProvisioningException, ArtifactException {
+        final ArtifactCoords coords = toArtifactCoords(fpId, copyArtifact.getArtifact(), copyArtifact.isOptional());
         if(coords == null) {
             return;
         }
@@ -878,11 +883,11 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
         }
     }
 
-    private ArtifactCoords toArtifactCoords(String str, boolean optional) throws ProvisioningException {
+    private ArtifactCoords toArtifactCoords(FPID fpId, String artifact, boolean optional) throws ProvisioningException {
 
-        String[] parts = str.split(":");
+        String[] parts = artifact.split(":");
         if(parts.length < 2) {
-            throw new IllegalArgumentException("Unexpected artifact coordinates format: " + str);
+            throw new IllegalArgumentException("Unexpected artifact coordinates format: " + artifact);
         }
         final String groupId = parts[0];
         final String artifactId = parts[1];
@@ -898,7 +903,7 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
                 if(parts.length > 4 && !parts[4].isEmpty()) {
                     ext = parts[4];
                     if (parts.length > 5) {
-                        throw new IllegalArgumentException("Unexpected artifact coordinates format: " + str);
+                        throw new IllegalArgumentException("Unexpected artifact coordinates format: " + artifact);
                     }
                 }
             }
@@ -908,12 +913,12 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
             return new ArtifactCoords(groupId, artifactId, version, classifier, ext);
         }
 
-        final String resolvedStr = versionResolver.resolveProperty(groupId + ':' + artifactId);
+        final String resolvedStr = versionResolver.resolveVersion(fpId, groupId + ':' + artifactId);
         if (resolvedStr == null) {
             if (optional) {
                 return null;
             }
-            throw new ProvisioningException("Failed to resolve the version of " + str);
+            throw new ProvisioningException("Failed to resolve the version of " + artifact);
         }
 
         parts = resolvedStr.split(":");
@@ -921,5 +926,120 @@ public class WfInstallPlugin extends ProvisioningPluginWithOptions implements In
             throw new ProvisioningException("Failed to resolve version for artifact: " + resolvedStr);
         }
         return new ArtifactCoords(groupId, artifactId, parts[2], classifier, ext);
+    }
+
+    /**
+     * Resolves artifact coordinates to versioned artifact coordinates.
+     */
+    static class VersionResolver {
+
+        /**
+         * @param fpId a {@link FPID} to remove the build suffix from
+         * @return {@code fpId.toString()} with any prefix starting with {@code '#'} stripped
+         */
+        static String stripBuild(FPID fpId) {
+            final String str = fpId.toString();
+            final int hashPos = str.lastIndexOf('#');
+            return hashPos >= 0 ? str.substring(0, hashPos) : str;
+        }
+
+        static class Builder {
+            private Map<String, Map<String, String>> fpIdToVersions = new LinkedHashMap<>();
+            private Map<String, List<String>> fpDependencies = new HashMap<>();
+
+            Builder() {
+                super();
+            }
+
+            Builder dependency(FPID dependent, List<FPID> dependencies) {
+                fpDependencies.put(stripBuild(dependent), dependencies.stream().map(id -> stripBuild(id)).collect(Collectors.toList()));
+                return this;
+            }
+            Builder artifactVersion(FPID fpId, String artifact, String version) {
+                final String id = stripBuild(fpId);
+                Map<String, String> versions = fpIdToVersions.get(id);
+                if (versions == null) {
+                    versions = new HashMap<>();
+                    fpIdToVersions.put(id, versions);
+                }
+                versions.put(artifact, version);
+                return this;
+            }
+
+            VersionResolver build() {
+                final Map<String, Map<String, String>> m = fpIdToVersions;
+                fpIdToVersions = null;
+                final Map<String, List<String>> deps = fpDependencies;
+                fpDependencies = null;
+                return new VersionResolver(m, deps);
+            }
+        }
+
+        private final Map<String, Map<String, String>> fpIdToVersions;
+        private final Map<String, List<String>> fpDependencies;
+
+        VersionResolver(Map<String, Map<String, String>> fpIdToVersions, Map<String, List<String>> fpDependencies) {
+            super();
+            this.fpIdToVersions = fpIdToVersions;
+            this.fpDependencies = fpDependencies;
+        }
+
+        /**
+         * Resolves the given {@code artifact} coordinates within the scope of the feature pack identified by the given
+         * {@code fpId} or its direct or indirect dependencies.
+         *
+         * @param fpId the ID of the feature pack within the scope of which the resolution should happen
+         * @param artifact versionless artifact coordinates
+         * @return versioned artifact coordinates
+         */
+        String resolveVersion(FPID fpId, String artifact) {
+            final String id = stripBuild(fpId);
+            return resolveVersion(id, artifact, new HashSet<>());
+        }
+
+        private String resolveVersion(String id, String artifact, Set<String> visited) {
+
+            final Map<String, String> versions = fpIdToVersions.get(id);
+            if (versions != null) {
+                final String result = versions.get(artifact);
+                if (result != null) {
+                    return result;
+                }
+            }
+
+            /* recurse the dependencies */
+            visited.add(id);
+            final List<String> deps = fpDependencies.get(id);
+            if (deps != null) {
+                for (String dep : deps) {
+                    if (!visited.contains(dep)) {
+                        /* avoid endless recursion caused by a cyclic dependency */
+                        final String transitiveResult = resolveVersion(dep, artifact, visited);
+                        if (transitiveResult != null) {
+                            return transitiveResult;
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Resolves the given {@code artifact} coordinates looking through all available feature packs; the latest (by
+         * addition order) wins.
+         *
+         * @param artifact versionless artifact coordinates
+         * @return versioned artifact coordinates
+         */
+        String resolveVersion(String artifact) {
+            String result = null;
+            for (Map<String, String> versions : fpIdToVersions.values()) {
+                String r = versions.get(artifact);
+                if (r != null) {
+                    result = r;
+                }
+            }
+            return result;
+        }
     }
 }
