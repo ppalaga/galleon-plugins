@@ -32,7 +32,7 @@ repositories:
     urls:
     - git:https://github.com/wildfly/galleon.git
     buildVersionPattern: .*-SNAPSHOT
-    buildRef: revision-3f3792c0952defa97abf499b37e93077306aa951
+    buildRef: revision-cd4b1d3cf65949544d551db238f56217b5ae2888
     buildArguments:
     - -Denforcer.skip
     - -Dlicense.skip
