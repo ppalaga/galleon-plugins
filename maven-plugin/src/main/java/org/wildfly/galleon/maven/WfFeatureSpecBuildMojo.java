@@ -155,6 +155,16 @@ public class WfFeatureSpecBuildMojo extends AbstractMojo {
     @Parameter(alias = "fork-embedded", required = false)
     private boolean forkEmbedded;
 
+
+    /**
+     * A directory from which an embedded WildFly instance will be started; if not set explicitly a temporary directory
+     * will be used. Setting an explicit directory might be useful if you need to perform some post mortem analysis of
+     * the WildFly installation. Unlike a temporary directory, an explicitly set one is not deleted when the Maven
+     * process exits.
+     */
+    @Parameter(alias = "wildfly-dir", property = "wfgp.wildflyDir")
+    private Path wildflyDir;
+
     @Component
     private ArchiverManager archiverManager;
 
@@ -169,11 +179,12 @@ public class WfFeatureSpecBuildMojo extends AbstractMojo {
 
         final long startTime = System.currentTimeMillis();
         Path modulesDir = null;
-        Path wildflyDir = null;
         int specsTotal = -1;
         try {
             modulesDir = Files.createTempDirectory(MODULES);
-            wildflyDir = Files.createTempDirectory("wf-specs-dist");
+            if (wildflyDir == null) {
+                wildflyDir = Files.createTempDirectory("wf-specs-dist");
+            }
             specsTotal = doExecute(wildflyDir, modulesDir);
         } catch (RuntimeException | Error | MojoExecutionException | MojoFailureException e) {
             throw e;
